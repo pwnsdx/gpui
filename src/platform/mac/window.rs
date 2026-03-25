@@ -1676,12 +1676,7 @@ fn supports_native_glass_effects() -> bool {
 }
 
 fn supports_native_material_style(style: MaterialStyle) -> bool {
-    supports_native_glass_effects()
-        && !matches!(
-            style.role,
-            MaterialRole::ScrollEdge | MaterialRole::BackgroundExtension
-        )
-        && style.variant != MaterialVariant::OpaqueFallback
+    supports_native_glass_effects() && style.variant != MaterialVariant::OpaqueFallback
 }
 
 unsafe fn gpui_bounds_to_native_view_frame(

@@ -222,8 +222,11 @@ impl MaterialFallbackPlatform {
 
 /// Return the native material capabilities currently implemented by GPUI.
 pub fn platform_material_capabilities() -> PlatformMaterialCapabilities {
+    let native_glass = runtime_native_glass_supported();
     PlatformMaterialCapabilities {
-        native_glass: runtime_native_glass_supported(),
+        native_glass,
+        background_extension: native_glass,
+        scroll_edge_effects: native_glass,
         adaptive_grouped_controls: true,
         ..PlatformMaterialCapabilities::default()
     }
@@ -636,8 +639,14 @@ mod tests {
     fn platform_material_capabilities_report_current_support() {
         let capabilities = platform_material_capabilities();
         assert_eq!(capabilities.native_glass, runtime_native_glass_supported());
-        assert!(!capabilities.background_extension);
-        assert!(!capabilities.scroll_edge_effects);
+        assert_eq!(
+            capabilities.background_extension,
+            runtime_native_glass_supported()
+        );
+        assert_eq!(
+            capabilities.scroll_edge_effects,
+            runtime_native_glass_supported()
+        );
         assert!(!capabilities.concentric_layout_regions);
         assert!(capabilities.adaptive_grouped_controls);
     }

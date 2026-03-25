@@ -165,9 +165,59 @@ pub struct PlatformMaterialCapabilities {
     pub adaptive_grouped_controls: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MaterialFallbackPreferences {
+    reduced_transparency: bool,
+    platform: MaterialFallbackPlatform,
+}
+
+impl Default for MaterialFallbackPreferences {
+    fn default() -> Self {
+        Self {
+            reduced_transparency: false,
+            platform: MaterialFallbackPlatform::current(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MaterialFallbackPlatform {
+    MacOS,
+    Windows,
+    Linux,
+    Other,
+}
+
+impl MaterialFallbackPlatform {
+    const fn current() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::MacOS
+        }
+
+        #[cfg(windows)]
+        {
+            Self::Windows
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            Self::Linux
+        }
+
+        #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+        {
+            Self::Other
+        }
+    }
+}
+
 /// Return the native material capabilities currently implemented by GPUI.
 pub fn platform_material_capabilities() -> PlatformMaterialCapabilities {
-    PlatformMaterialCapabilities::default()
+    PlatformMaterialCapabilities {
+        adaptive_grouped_controls: true,
+        ..PlatformMaterialCapabilities::default()
+    }
 }
 
 /// Create a semantic material surface using GPUI's cross-platform fallback
@@ -177,13 +227,15 @@ pub fn platform_material_capabilities() -> PlatformMaterialCapabilities {
 /// It returns a styled [`Div`] so callers can continue to compose layout and
 /// children using normal GPUI patterns while the backend implementation evolves.
 pub fn material_surface(window: &Window, style: MaterialStyle) -> Div {
+    let preferences = MaterialFallbackPreferences::default();
     let appearance = DefaultAppearance::from(window.appearance());
     let active = window.is_window_active();
-    let background = material_background(appearance, active, style);
-    let border = material_border_color(appearance, active, style);
-    let radius = material_corner_radius(style.role);
+    let resolved_style = resolve_material_style(style, active, preferences);
+    let background = material_background(appearance, active, resolved_style, preferences);
+    let border = material_border_color(appearance, active, resolved_style, preferences);
+    let radius = material_corner_radius(resolved_style.role);
     let should_shadow = !matches!(
-        style.role,
+        resolved_style.role,
         MaterialRole::ScrollEdge | MaterialRole::BackgroundExtension
     );
 
@@ -215,10 +267,11 @@ fn material_background(
     appearance: DefaultAppearance,
     active: bool,
     style: MaterialStyle,
+    preferences: MaterialFallbackPreferences,
 ) -> Background {
     let (top, bottom) = match appearance {
-        DefaultAppearance::Light => light_material_pair(active, style),
-        DefaultAppearance::Dark => dark_material_pair(active, style),
+        DefaultAppearance::Light => light_material_pair(active, style, preferences),
+        DefaultAppearance::Dark => dark_material_pair(active, style, preferences),
     };
     linear_gradient(
         180.0,
@@ -231,8 +284,9 @@ fn material_border_color(
     appearance: DefaultAppearance,
     active: bool,
     style: MaterialStyle,
+    preferences: MaterialFallbackPreferences,
 ) -> crate::Rgba {
-    let alpha = match (style.emphasis, active, style.interactive) {
+    let mut alpha = match (style.emphasis, active, style.interactive) {
         (MaterialEmphasis::High, true, true) => 0.32,
         (MaterialEmphasis::High, true, false) => 0.24,
         (MaterialEmphasis::Medium, true, true) => 0.24,
@@ -242,6 +296,7 @@ fn material_border_color(
         (MaterialEmphasis::Medium, false, _) => 0.14,
         (MaterialEmphasis::Low, false, _) => 0.1,
     };
+    alpha = (alpha + platform_border_bias(preferences.platform, style.variant)).clamp(0.08, 0.4);
 
     match appearance {
         DefaultAppearance::Light => opaque_grey(1.0, alpha).to_rgb(),
@@ -249,8 +304,12 @@ fn material_border_color(
     }
 }
 
-fn light_material_pair(active: bool, style: MaterialStyle) -> (crate::Hsla, crate::Hsla) {
-    let base_alpha = alpha_for_style(active, style);
+fn light_material_pair(
+    active: bool,
+    style: MaterialStyle,
+    preferences: MaterialFallbackPreferences,
+) -> (crate::Hsla, crate::Hsla) {
+    let base_alpha = alpha_for_style(active, style, preferences);
     let tint_shift = if style.tinted { 0.04 } else { 0.0 };
 
     match style.role {
@@ -281,8 +340,12 @@ fn light_material_pair(active: bool, style: MaterialStyle) -> (crate::Hsla, crat
     }
 }
 
-fn dark_material_pair(active: bool, style: MaterialStyle) -> (crate::Hsla, crate::Hsla) {
-    let base_alpha = alpha_for_style(active, style);
+fn dark_material_pair(
+    active: bool,
+    style: MaterialStyle,
+    preferences: MaterialFallbackPreferences,
+) -> (crate::Hsla, crate::Hsla) {
+    let base_alpha = alpha_for_style(active, style, preferences);
     let accent_saturation = if style.tinted { 0.18 } else { 0.08 };
 
     match style.role {
@@ -295,25 +358,59 @@ fn dark_material_pair(active: bool, style: MaterialStyle) -> (crate::Hsla, crate
             hsla(0.60, accent_saturation + 0.02, 0.14, base_alpha + 0.05),
         ),
         MaterialRole::Overlay => (
-            hsla(0.60, accent_saturation + 0.02, 0.18, (base_alpha + 0.08).min(0.98)),
-            hsla(0.60, accent_saturation + 0.04, 0.10, (base_alpha + 0.12).min(0.99)),
+            hsla(
+                0.60,
+                accent_saturation + 0.02,
+                0.18,
+                (base_alpha + 0.08).min(0.98),
+            ),
+            hsla(
+                0.60,
+                accent_saturation + 0.04,
+                0.10,
+                (base_alpha + 0.12).min(0.99),
+            ),
         ),
         MaterialRole::SearchField => (
-            hsla(0.60, accent_saturation - 0.02, 0.22, (base_alpha - 0.10).max(0.20)),
+            hsla(
+                0.60,
+                accent_saturation - 0.02,
+                0.22,
+                (base_alpha - 0.10).max(0.20),
+            ),
             hsla(0.60, accent_saturation, 0.14, (base_alpha - 0.04).max(0.24)),
         ),
         MaterialRole::ScrollEdge => (
-            hsla(0.60, accent_saturation - 0.03, 0.18, (base_alpha - 0.14).max(0.16)),
+            hsla(
+                0.60,
+                accent_saturation - 0.03,
+                0.18,
+                (base_alpha - 0.14).max(0.16),
+            ),
             hsla(0.60, accent_saturation, 0.10, (base_alpha - 0.02).max(0.22)),
         ),
         MaterialRole::BackgroundExtension => (
-            hsla(0.60, accent_saturation - 0.04, 0.16, (base_alpha - 0.18).max(0.08)),
-            hsla(0.60, accent_saturation - 0.02, 0.09, (base_alpha - 0.10).max(0.12)),
+            hsla(
+                0.60,
+                accent_saturation - 0.04,
+                0.16,
+                (base_alpha - 0.18).max(0.08),
+            ),
+            hsla(
+                0.60,
+                accent_saturation - 0.02,
+                0.09,
+                (base_alpha - 0.10).max(0.12),
+            ),
         ),
     }
 }
 
-fn alpha_for_style(active: bool, style: MaterialStyle) -> f32 {
+fn alpha_for_style(
+    active: bool,
+    style: MaterialStyle,
+    preferences: MaterialFallbackPreferences,
+) -> f32 {
     let emphasis: f32 = match style.emphasis {
         MaterialEmphasis::Low => 0.0,
         MaterialEmphasis::Medium => 0.06,
@@ -334,8 +431,58 @@ fn alpha_for_style(active: bool, style: MaterialStyle) -> f32 {
     };
     let interaction: f32 = if style.interactive { 0.04 } else { 0.0 };
     let activation: f32 = if active { 0.0 } else { -0.08 };
+    let platform = platform_alpha_bias(preferences.platform, style.variant);
 
-    (role + emphasis + variant + interaction + activation).clamp(0.08_f32, 0.96_f32)
+    (role + emphasis + variant + interaction + activation + platform).clamp(0.08_f32, 0.96_f32)
+}
+
+fn resolve_material_style(
+    mut style: MaterialStyle,
+    active: bool,
+    preferences: MaterialFallbackPreferences,
+) -> MaterialStyle {
+    if preferences.reduced_transparency {
+        style.variant = MaterialVariant::OpaqueFallback;
+    } else if !active && matches!(style.variant, MaterialVariant::Clear) {
+        style.variant = MaterialVariant::Adaptive;
+    }
+
+    if !active && style.interactive {
+        style.emphasis = soften_emphasis(style.emphasis);
+    }
+
+    style
+}
+
+fn soften_emphasis(emphasis: MaterialEmphasis) -> MaterialEmphasis {
+    match emphasis {
+        MaterialEmphasis::High => MaterialEmphasis::Medium,
+        MaterialEmphasis::Medium | MaterialEmphasis::Low => MaterialEmphasis::Low,
+    }
+}
+
+fn platform_alpha_bias(platform: MaterialFallbackPlatform, variant: MaterialVariant) -> f32 {
+    match (platform, variant) {
+        (MaterialFallbackPlatform::MacOS, _) => 0.0,
+        (MaterialFallbackPlatform::Windows, MaterialVariant::Clear) => 0.06,
+        (MaterialFallbackPlatform::Windows, _) => 0.03,
+        (MaterialFallbackPlatform::Linux, MaterialVariant::Clear) => 0.12,
+        (MaterialFallbackPlatform::Linux, _) => 0.08,
+        (MaterialFallbackPlatform::Other, MaterialVariant::Clear) => 0.10,
+        (MaterialFallbackPlatform::Other, _) => 0.06,
+    }
+}
+
+fn platform_border_bias(platform: MaterialFallbackPlatform, variant: MaterialVariant) -> f32 {
+    match (platform, variant) {
+        (MaterialFallbackPlatform::MacOS, _) => 0.0,
+        (MaterialFallbackPlatform::Windows, MaterialVariant::Clear) => 0.04,
+        (MaterialFallbackPlatform::Windows, _) => 0.02,
+        (MaterialFallbackPlatform::Linux, MaterialVariant::Clear) => 0.06,
+        (MaterialFallbackPlatform::Linux, _) => 0.03,
+        (MaterialFallbackPlatform::Other, MaterialVariant::Clear) => 0.05,
+        (MaterialFallbackPlatform::Other, _) => 0.03,
+    }
 }
 
 #[cfg(test)]
@@ -353,8 +500,111 @@ mod tests {
     }
 
     #[test]
-    fn platform_material_capabilities_start_conservative() {
+    fn platform_material_capabilities_report_current_fallback_support() {
         let capabilities = platform_material_capabilities();
-        assert_eq!(capabilities, PlatformMaterialCapabilities::default());
+        assert!(!capabilities.native_glass);
+        assert!(!capabilities.background_extension);
+        assert!(!capabilities.scroll_edge_effects);
+        assert!(!capabilities.concentric_layout_regions);
+        assert!(capabilities.adaptive_grouped_controls);
+    }
+
+    #[test]
+    fn reduced_transparency_forces_opaque_variant() {
+        let style = resolve_material_style(
+            MaterialStyle::overlay().variant(MaterialVariant::Clear),
+            true,
+            MaterialFallbackPreferences {
+                reduced_transparency: true,
+                platform: MaterialFallbackPlatform::MacOS,
+            },
+        );
+
+        assert_eq!(style.variant, MaterialVariant::OpaqueFallback);
+    }
+
+    #[test]
+    fn inactive_clear_materials_fall_back_to_adaptive_variant() {
+        let style = resolve_material_style(
+            MaterialStyle::toolbar().variant(MaterialVariant::Clear),
+            false,
+            MaterialFallbackPreferences {
+                reduced_transparency: false,
+                platform: MaterialFallbackPlatform::MacOS,
+            },
+        );
+
+        assert_eq!(style.variant, MaterialVariant::Adaptive);
+    }
+
+    #[test]
+    fn inactive_interactive_materials_soften_emphasis() {
+        let style = resolve_material_style(
+            MaterialStyle::grouped_controls()
+                .interactive(true)
+                .emphasis(MaterialEmphasis::High),
+            false,
+            MaterialFallbackPreferences {
+                reduced_transparency: false,
+                platform: MaterialFallbackPlatform::MacOS,
+            },
+        );
+
+        assert_eq!(style.emphasis, MaterialEmphasis::Medium);
+    }
+
+    #[test]
+    fn linux_fallback_bias_is_more_opaque_than_macos() {
+        let style = MaterialStyle::toolbar().variant(MaterialVariant::Clear);
+        let mac_alpha = alpha_for_style(
+            true,
+            style,
+            MaterialFallbackPreferences {
+                reduced_transparency: false,
+                platform: MaterialFallbackPlatform::MacOS,
+            },
+        );
+        let linux_alpha = alpha_for_style(
+            true,
+            style,
+            MaterialFallbackPreferences {
+                reduced_transparency: false,
+                platform: MaterialFallbackPlatform::Linux,
+            },
+        );
+
+        assert!(linux_alpha > mac_alpha);
+    }
+
+    #[test]
+    fn non_macos_platforms_bias_clear_materials_toward_more_opacity() {
+        let style = MaterialStyle::overlay().variant(MaterialVariant::Clear);
+        let mac_alpha = alpha_for_style(
+            true,
+            style,
+            MaterialFallbackPreferences {
+                reduced_transparency: false,
+                platform: MaterialFallbackPlatform::MacOS,
+            },
+        );
+        let windows_alpha = alpha_for_style(
+            true,
+            style,
+            MaterialFallbackPreferences {
+                reduced_transparency: false,
+                platform: MaterialFallbackPlatform::Windows,
+            },
+        );
+        let other_alpha = alpha_for_style(
+            true,
+            style,
+            MaterialFallbackPreferences {
+                reduced_transparency: false,
+                platform: MaterialFallbackPlatform::Other,
+            },
+        );
+
+        assert!(windows_alpha > mac_alpha);
+        assert!(other_alpha > mac_alpha);
     }
 }

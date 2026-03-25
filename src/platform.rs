@@ -38,10 +38,10 @@ pub(crate) mod scap_screen_capture;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
-    ShapedRun, SharedString, Size, SvgRenderer, SvgSize, SystemWindowTab, Task, TaskLabel, Window,
-    WindowControlArea, hash, point, px, size,
+    ForegroundExecutor, GlobalElementId, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout,
+    MaterialStyle, Pixels, PlatformInput, Point, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SvgSize,
+    SystemWindowTab, Task, TaskLabel, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -483,6 +483,17 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn is_hovered(&self) -> bool;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    fn begin_native_material_frame(&self) {}
+    fn supports_native_material_surface(&self, _style: MaterialStyle) -> bool {
+        false
+    }
+    fn sync_native_material_surface(
+        &self,
+        _id: &GlobalElementId,
+        _bounds: Bounds<Pixels>,
+        _style: MaterialStyle,
+    ) {
+    }
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);

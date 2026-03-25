@@ -1,12 +1,13 @@
 use super::{BoolExt, MacDisplay, NSRange, NSStringExt, ns_string, renderer};
 use crate::{
     AnyWindowHandle, Bounds, Capslock, DisplayLink, ExternalPaths, FileDropEvent,
-    ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    SharedString, Size, SystemWindowTab, Timer, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowKind, WindowParams, dispatch_get_main_queue,
-    dispatch_sys::dispatch_async_f, platform::PlatformInputHandler, point, px, size,
+    ForegroundExecutor, GlobalElementId, KeyDownEvent, Keystroke, MaterialRole, MaterialStyle,
+    MaterialVariant, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, Timer,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
+    WindowParams, dispatch_get_main_queue, dispatch_sys::dispatch_async_f,
+    platform::PlatformInputHandler, point, px, size,
 };
 use block::ConcreteBlock;
 use cocoa::{
@@ -41,6 +42,7 @@ use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
     cell::Cell,
+    collections::HashMap,
     ffi::{CStr, c_void},
     mem,
     ops::Range,
@@ -394,6 +396,8 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
+    native_material_surfaces: HashMap<String, NativeMaterialSurfaceState>,
+    native_material_generation: u64,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -423,6 +427,11 @@ struct MacWindowState {
     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
+}
+
+struct NativeMaterialSurfaceState {
+    glass_view: id,
+    generation: u64,
 }
 
 impl MacWindowState {
@@ -692,6 +701,8 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
+                native_material_surfaces: HashMap::default(),
+                native_material_generation: 0,
                 display_link: None,
                 renderer: renderer::new_renderer(
                     renderer_context,
@@ -1332,6 +1343,40 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn begin_native_material_frame(&self) {
+        let mut this = self.0.lock();
+        this.native_material_generation = this.native_material_generation.wrapping_add(1).max(1);
+    }
+
+    fn supports_native_material_surface(&self, style: MaterialStyle) -> bool {
+        supports_native_material_style(style)
+    }
+
+    fn sync_native_material_surface(
+        &self,
+        id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        style: MaterialStyle,
+    ) {
+        if !supports_native_material_style(style) {
+            return;
+        }
+
+        let mut this = self.0.lock();
+        let generation = this.native_material_generation;
+        let key = id.to_string();
+        let frame = unsafe { gpui_bounds_to_native_view_frame(this.native_view.as_ptr(), bounds) };
+        let glass_view = unsafe { ensure_native_material_surface(&mut this, &key, frame) };
+
+        unsafe {
+            configure_native_material_surface(glass_view, style);
+        }
+
+        if let Some(surface) = this.native_material_surfaces.get_mut(&key) {
+            surface.generation = generation;
+        }
+    }
+
     fn set_edited(&mut self, edited: bool) {
         unsafe {
             let window = self.0.lock().native_window;
@@ -1498,6 +1543,20 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    fn completed_frame(&self) {
+        let mut this = self.0.lock();
+        let active_generation = this.native_material_generation;
+        this.native_material_surfaces.retain(|_, surface| {
+            let keep = surface.generation == active_generation;
+            if !keep {
+                unsafe {
+                    NSView::removeFromSuperview(surface.glass_view);
+                }
+            }
+            keep
+        });
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }
@@ -1610,6 +1669,106 @@ fn get_scale_factor(native_window: id) -> f32 {
     // it was rendered for real.
     // Regardless, attempt to avoid the issue here.
     if factor == 0.0 { 2. } else { factor }
+}
+
+fn supports_native_glass_effects() -> bool {
+    Class::get("NSGlassEffectView").is_some()
+}
+
+fn supports_native_material_style(style: MaterialStyle) -> bool {
+    supports_native_glass_effects()
+        && !matches!(
+            style.role,
+            MaterialRole::ScrollEdge | MaterialRole::BackgroundExtension
+        )
+        && style.variant != MaterialVariant::OpaqueFallback
+}
+
+unsafe fn gpui_bounds_to_native_view_frame(
+    native_view: *mut Object,
+    bounds: Bounds<Pixels>,
+) -> NSRect {
+    let view_bounds = unsafe { NSView::bounds(native_view as id) };
+    NSRect::new(
+        NSPoint::new(
+            bounds.origin.x.0 as f64,
+            (view_bounds.size.height as f32 - bounds.origin.y.0 - bounds.size.height.0) as f64,
+        ),
+        NSSize::new(bounds.size.width.0 as f64, bounds.size.height.0 as f64),
+    )
+}
+
+unsafe fn ensure_native_material_surface(
+    lock: &mut MacWindowState,
+    key: &str,
+    frame: NSRect,
+) -> id {
+    if let Some(surface) = lock.native_material_surfaces.get(key) {
+        let _: () = msg_send![surface.glass_view, setFrame: frame];
+        return surface.glass_view;
+    }
+
+    let content_view = unsafe { lock.native_window.contentView() };
+    let mut glass_view: id = msg_send![class!(NSGlassEffectView), alloc];
+    glass_view = unsafe { NSView::initWithFrame_(glass_view, frame) };
+    let _: () = msg_send![glass_view, setAutoresizingMask: 0usize];
+
+    let native_view = lock.native_view.as_ptr() as id;
+    let _: () = msg_send![
+        content_view,
+        addSubview: glass_view
+        positioned: NSWindowOrderingMode::NSWindowBelow
+        relativeTo: native_view
+    ];
+
+    let glass_view = unsafe { glass_view.autorelease() };
+    lock.native_material_surfaces.insert(
+        key.to_string(),
+        NativeMaterialSurfaceState {
+            glass_view,
+            generation: lock.native_material_generation,
+        },
+    );
+    glass_view
+}
+
+unsafe fn configure_native_material_surface(glass_view: id, style: MaterialStyle) {
+    let clear: id = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![glass_view, setWantsLayer: YES];
+    let _: () = msg_send![glass_view, setAutoresizingMask: 0usize];
+
+    if msg_send![glass_view, respondsToSelector: sel!(setContentViewMargins:)] {
+        let _: () = msg_send![glass_view, setContentViewMargins: NSSize::new(0.0, 0.0)];
+    }
+
+    if msg_send![glass_view, respondsToSelector: sel!(setContentViewClippingOptions:)] {
+        let _: () = msg_send![glass_view, setContentViewClippingOptions: 0usize];
+    }
+
+    if msg_send![glass_view, respondsToSelector: sel!(setTintColor:)] {
+        let tint = if style.tinted {
+            let accent: id = msg_send![class!(NSColor), controlAccentColor];
+            accent
+        } else {
+            clear
+        };
+        let _: () = msg_send![glass_view, setTintColor: tint];
+    }
+
+    if msg_send![glass_view, respondsToSelector: sel!(setCornerRadius:)] {
+        let radius = match style.role {
+            MaterialRole::Sidebar | MaterialRole::Toolbar | MaterialRole::Inspector => 18.0,
+            MaterialRole::Overlay => 20.0,
+            MaterialRole::SearchField => 14.0,
+            MaterialRole::GroupedControls => 16.0,
+            MaterialRole::ScrollEdge | MaterialRole::BackgroundExtension => 18.0,
+        };
+        let _: () = msg_send![glass_view, setCornerRadius: radius];
+    }
+
+    if msg_send![glass_view, respondsToSelector: sel!(setInteractive:)] {
+        let _: () = msg_send![glass_view, setInteractive: if style.interactive { YES } else { NO }];
+    }
 }
 
 unsafe fn get_window_state(object: &Object) -> Arc<Mutex<MacWindowState>> {

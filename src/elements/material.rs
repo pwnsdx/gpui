@@ -1,7 +1,14 @@
 use crate::{
-    Background, Div, Window, colors::DefaultAppearance, div, hsla, linear_color_stop,
-    linear_gradient, opaque_grey, px, styled::Styled,
+    AnyElement, App, Background, Bounds, Div, Element, ElementId, GlobalElementId,
+    InspectorElementId, IntoElement, LayoutId, ParentElement, StyleRefinement, Window,
+    colors::DefaultAppearance, div, hsla, linear_color_stop, linear_gradient, opaque_grey, px,
+    styled::Styled,
 };
+#[cfg(target_os = "macos")]
+use objc::runtime::Class;
+use refineable::Refineable as _;
+use smallvec::SmallVec;
+use std::mem;
 
 /// A semantic role for a material surface.
 ///
@@ -180,6 +187,7 @@ impl Default for MaterialFallbackPreferences {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum MaterialFallbackPlatform {
     MacOS,
@@ -215,41 +223,152 @@ impl MaterialFallbackPlatform {
 /// Return the native material capabilities currently implemented by GPUI.
 pub fn platform_material_capabilities() -> PlatformMaterialCapabilities {
     PlatformMaterialCapabilities {
+        native_glass: runtime_native_glass_supported(),
         adaptive_grouped_controls: true,
         ..PlatformMaterialCapabilities::default()
     }
 }
 
-/// Create a semantic material surface using GPUI's cross-platform fallback
-/// renderer.
+/// Create a semantic material surface using GPUI's semantic material backend.
 ///
 /// This helper intentionally exposes semantic roles instead of platform APIs.
-/// It returns a styled [`Div`] so callers can continue to compose layout and
-/// children using normal GPUI patterns while the backend implementation evolves.
-pub fn material_surface(window: &Window, style: MaterialStyle) -> Div {
-    let preferences = MaterialFallbackPreferences::default();
-    let appearance = DefaultAppearance::from(window.appearance());
-    let active = window.is_window_active();
-    let resolved_style = resolve_material_style(style, active, preferences);
-    let background = material_background(appearance, active, resolved_style, preferences);
-    let border = material_border_color(appearance, active, resolved_style, preferences);
-    let radius = material_corner_radius(resolved_style.role);
-    let should_shadow = !matches!(
-        resolved_style.role,
-        MaterialRole::ScrollEdge | MaterialRole::BackgroundExtension
-    );
+/// It returns a styled parent element so callers can continue to compose
+/// layout and children using normal GPUI patterns while the backend
+/// implementation evolves.
+#[track_caller]
+pub fn material_surface(_window: &Window, style: MaterialStyle) -> MaterialSurface {
+    let source = core::panic::Location::caller();
+    MaterialSurface {
+        material_style: style,
+        style: StyleRefinement::default(),
+        children: SmallVec::default(),
+        source,
+        element_id: ElementId::CodeLocation(*source),
+    }
+}
 
-    let mut surface = div()
-        .rounded(px(radius))
-        .border(px(1.0))
-        .border_color(border)
-        .bg(background);
+/// A semantic material surface element.
+pub struct MaterialSurface {
+    material_style: MaterialStyle,
+    style: StyleRefinement,
+    children: SmallVec<[AnyElement; 2]>,
+    source: &'static core::panic::Location<'static>,
+    element_id: ElementId,
+}
 
-    if should_shadow {
-        surface = surface.shadow_sm();
+impl MaterialSurface {
+    fn build_surface(&mut self, window: &Window) -> Div {
+        let preferences = MaterialFallbackPreferences::default();
+        let appearance = DefaultAppearance::from(window.appearance());
+        let active = window.is_window_active();
+        let resolved_style = resolve_material_style(self.material_style, active, preferences);
+        let background = material_background(appearance, active, resolved_style, preferences);
+        let border = material_border_color(appearance, active, resolved_style, preferences);
+        let radius = material_corner_radius(resolved_style.role);
+        let should_shadow = !matches!(
+            resolved_style.role,
+            MaterialRole::ScrollEdge | MaterialRole::BackgroundExtension
+        );
+        let use_native_backend = should_use_native_material_surface(window, resolved_style);
+
+        let mut surface = div()
+            .rounded(px(radius))
+            .border(px(1.0))
+            .border_color(border);
+
+        if !use_native_backend {
+            surface = surface.bg(background);
+        }
+
+        if should_shadow {
+            surface = surface.shadow_sm();
+        }
+
+        surface.style().refine(&self.style);
+        surface.children(mem::take(&mut self.children))
+    }
+}
+
+impl ParentElement for MaterialSurface {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.children.extend(elements);
+    }
+}
+
+impl Styled for MaterialSurface {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+impl IntoElement for MaterialSurface {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for MaterialSurface {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.element_id.clone())
     }
 
-    surface
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        Some(self.source)
+    }
+
+    fn request_layout(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut surface = self.build_surface(window).into_any_element();
+        let layout_id = surface.request_layout(window, cx);
+        (layout_id, surface)
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<crate::Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let resolved_style = resolve_material_style(
+            self.material_style,
+            window.is_window_active(),
+            MaterialFallbackPreferences::default(),
+        );
+
+        if should_use_native_material_surface(window, resolved_style)
+            && let Some(global_id) = global_id
+        {
+            window.sync_native_material_surface(global_id, bounds, resolved_style);
+        }
+
+        request_layout.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<crate::Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        request_layout.paint(window, cx);
+    }
 }
 
 fn material_corner_radius(role: MaterialRole) -> f32 {
@@ -485,6 +604,20 @@ fn platform_border_bias(platform: MaterialFallbackPlatform, variant: MaterialVar
     }
 }
 
+fn should_use_native_material_surface(window: &Window, style: MaterialStyle) -> bool {
+    window.supports_native_material_surface(style)
+}
+
+#[cfg(target_os = "macos")]
+fn runtime_native_glass_supported() -> bool {
+    Class::get("NSGlassEffectView").is_some()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn runtime_native_glass_supported() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,9 +633,9 @@ mod tests {
     }
 
     #[test]
-    fn platform_material_capabilities_report_current_fallback_support() {
+    fn platform_material_capabilities_report_current_support() {
         let capabilities = platform_material_capabilities();
-        assert!(!capabilities.native_glass);
+        assert_eq!(capabilities.native_glass, runtime_native_glass_supported());
         assert!(!capabilities.background_extension);
         assert!(!capabilities.scroll_edge_effects);
         assert!(!capabilities.concentric_layout_regions);
